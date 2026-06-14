@@ -15,6 +15,20 @@ SSH_WRAPPER_PATH = "/share/libvirt/"
 DEFAULT_SSH_HOST = "root@localhost"
 DEFAULT_URI = "qemu:///system"
 
+# Try to import libvirt for local connections
+try:
+    import libvirt
+    LIBVIRT_AVAILABLE = True
+except ImportError:
+    LIBVIRT_AVAILABLE = False
+    _LOGGER.warning("libvirt Python module not available, will use virsh commands instead")
+
+
+def is_local_connection(ssh_host):
+    """Check if connection is local (no SSH needed)"""
+    return ssh_host is None or ssh_host == "" or ssh_host.lower() in ["localhost", "127.0.0.1", "::1"]
+
+
 def take_screenshot(vm_name, ssh_host, local_path):
     ensure_ssh_wrapper()
 
@@ -22,13 +36,53 @@ def take_screenshot(vm_name, ssh_host, local_path):
     remote_png = f"/tmp/{vm_name}.png"
     os.makedirs(os.path.dirname(local_path), exist_ok=True)
 
-    # Step 1: Try taking the screenshot
+    # Local connection - use direct virsh
+    if is_local_connection(ssh_host):
+        try:
+            result = subprocess.run(
+                ["virsh", "-c", DEFAULT_URI, "screenshot", vm_name, remote_ppm, "--screen", "0"],
+                capture_output=True,
+                text=True,
+                timeout=10
+            )
+            if result.returncode != 0:
+                raise RuntimeError("VM might be offline or screenshot failed.")
+        except Exception:
+            fallback = os.path.join(os.path.dirname(__file__), "offline.png")
+            try:
+                shutil.copyfile(fallback, local_path)
+            except Exception as e:
+                _LOGGER.error(f"Error copying fallback image: {e}")
+            return False
+
+        # Convert PPM to PNG
+        try:
+            convert_cmd = ["convert", remote_ppm, remote_png]
+            subprocess.run(convert_cmd, check=True, capture_output=True, timeout=10)
+        except subprocess.CalledProcessError as e:
+            _LOGGER.error(f"Failed to convert screenshot to PNG: {e.stderr}")
+            return False
+        except Exception as e:
+            _LOGGER.error(f"Unexpected error during conversion: {e}")
+            return False
+
+        # Read and encode
+        try:
+            with open(remote_png, "rb") as f:
+                with open(local_path, "wb") as out_f:
+                    out_f.write(f.read())
+        except Exception as e:
+            _LOGGER.error(f"Failed to copy screenshot to {local_path}: {e}")
+            return False
+
+        return True
+
+    # SSH connection - use existing method
     try:
         result = run_virsh(["screenshot", vm_name, remote_ppm, "--screen", "0"], ssh_host=ssh_host)
         if result is None:
             raise RuntimeError("VM might be offline or screenshot failed.")
     except Exception:
-        # Step 1 fallback: offline image
         fallback = os.path.join(os.path.dirname(__file__), "offline.png")
         try:
             shutil.copyfile(fallback, local_path)
@@ -139,14 +193,46 @@ fi
         os.chmod(SSH_WRAPPER, 0o755)
 
 
-def run_virsh(args, ssh_host=DEFAULT_SSH_HOST, uri=DEFAULT_URI):
+def run_virsh(args, ssh_host=None, uri=None):
+    """
+    Run virsh command either locally or via SSH.
+    
+    Args:
+        args: List of virsh arguments
+        ssh_host: SSH host string (e.g. 'user@host:port'). If None or 'localhost', use local connection.
+        uri: Libvirt URI (defaults to DEFAULT_URI)
+    
+    Returns:
+        Command output as string
+    """
+    if uri is None:
+        uri = DEFAULT_URI
+    
+    # Local connection
+    if is_local_connection(ssh_host):
+        try:
+            cmd = ["virsh", "-c", uri] + args
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=10
+            )
+
+            if result.returncode != 0:
+                raise subprocess.CalledProcessError(result.returncode, result.args, output=result.stdout, stderr=result.stderr)
+
+            return result.stdout.strip()
+
+        except Exception as e:
+            _LOGGER.error(f"Local virsh command failed: {e}")
+            raise
+
+    # SSH connection (existing behavior)
     ensure_ssh_wrapper()
     
     try:
-        # The ssh_host can now be in format: user@host:port or user@host
-        # The wrapper script handles the port extraction
-        cmd = [SSH_WRAPPER, ssh_host, "virsh", "-c", "qemu:///system"] + args  # Note: using uri parameter instead of hardcoded "qemu:///system"
-
+        cmd = [SSH_WRAPPER, ssh_host, "virsh", "-c", uri] + args
         result = subprocess.run(
             cmd,
             capture_output=True,
@@ -162,13 +248,18 @@ def run_virsh(args, ssh_host=DEFAULT_SSH_HOST, uri=DEFAULT_URI):
     except Exception as e:
         raise
 
-def get_all_vms(ssh_host=DEFAULT_SSH_HOST, uri=DEFAULT_URI):
+
+def get_all_vms(ssh_host=None, uri=None):
+    if uri is None:
+        uri = DEFAULT_URI
     output = run_virsh(["list", "--all", "--name"], ssh_host, uri)
     return [line.strip() for line in output.splitlines() if line.strip()]
 
 
 
-def get_vm_info(name, ssh_host=DEFAULT_SSH_HOST, uri=DEFAULT_URI):
+def get_vm_info(name, ssh_host=None, uri=None):
+    if uri is None:
+        uri = DEFAULT_URI
     output = run_virsh(["dominfo", name], ssh_host, uri)
     data = {}
     for line in output.splitlines():
@@ -178,7 +269,9 @@ def get_vm_info(name, ssh_host=DEFAULT_SSH_HOST, uri=DEFAULT_URI):
     return data
 
 
-def get_vm_interfaces(vm_name, ssh_host=DEFAULT_SSH_HOST, uri=DEFAULT_URI):
+def get_vm_interfaces(vm_name, ssh_host=None, uri=None):
+    if uri is None:
+        uri = DEFAULT_URI
     try:
         output = run_virsh(["domifaddr", vm_name, "--source", "agent"], ssh_host, uri)
     except subprocess.CalledProcessError as e:
@@ -217,14 +310,18 @@ def get_vm_interfaces(vm_name, ssh_host=DEFAULT_SSH_HOST, uri=DEFAULT_URI):
 
     return interfaces
 
-def get_vm_ip(vm_name, ssh_host=DEFAULT_SSH_HOST, uri=DEFAULT_URI):
+def get_vm_ip(vm_name, ssh_host=None, uri=None):
+    if uri is None:
+        uri = DEFAULT_URI
     interfaces = get_vm_interfaces(vm_name, ssh_host, uri)
     for iface in interfaces:
         if iface["protocol"] == "ipv4" and not iface["address"].startswith("127."):
             return iface["address"].split("/")[0]
     return None
 
-def list_snapshots(vm_name, ssh_host=DEFAULT_SSH_HOST, uri=DEFAULT_URI):
+def list_snapshots(vm_name, ssh_host=None, uri=None):
+    if uri is None:
+        uri = DEFAULT_URI
     try:
         output = run_virsh(["snapshot-list", "--domain", vm_name], ssh_host, uri)
         lines = output.splitlines()[2:]  # Skip headers

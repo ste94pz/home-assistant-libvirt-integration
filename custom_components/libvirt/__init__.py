@@ -1,4 +1,4 @@
-from .virsh import ensure_ssh_wrapper, SSH_WRAPPER, run_virsh, is_vm_running, DEFAULT_URI, take_screenshot
+from .virsh import ensure_ssh_wrapper, SSH_WRAPPER, run_virsh, is_vm_running, DEFAULT_URI, take_screenshot, is_local_connection
 import os
 import subprocess
 import logging
@@ -16,15 +16,17 @@ async def async_setup(hass, config):
         for entry in config.get(platform, []):
             if isinstance(entry, dict) and entry.get("platform") == DOMAIN:
                 ssh_host = entry.get("ssh_host")
+                # If ssh_host is not provided or is localhost, treat as local connection
                 if not ssh_host:
-                    continue
+                    ssh_host = None
                 try:
                     output = run_virsh(["list", "--all", "--name"], ssh_host=ssh_host, uri=DEFAULT_URI)
                     vm_names = [line.strip() for line in output.splitlines() if line.strip()]
                     for vm_name in vm_names:
                         ssh_map[vm_name] = ssh_host
                 except Exception as e:
-                    _LOGGER.error(f"Failed to get VMs from {ssh_host}: {e}")
+                    host_label = ssh_host if ssh_host else "localhost"
+                    _LOGGER.error(f"Failed to get VMs from {host_label}: {e}")
 
     hass.data[DOMAIN] = {
         name: {"ssh_host": ssh_host} for name, ssh_host in ssh_map.items()
